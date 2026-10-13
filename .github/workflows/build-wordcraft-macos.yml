@@ -1,0 +1,148 @@
+
+name: Build macOS Intel App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Detect application
+        id: app
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"].split("/")[-1].lower()
+          data = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--no-deps", "--format-version", "1"
+          ]))
+
+          packages = [
+              p for p in data["packages"]
+              if p["name"].lower().replace("-", "") == repo.replace("-", "")
+          ]
+
+          if len(packages) != 1:
+              raise SystemExit(
+                  f"Could not uniquely find Cargo package for {repo}"
+              )
+
+          package = packages[0]
+          bins = [
+              t["name"] for t in package["targets"]
+              if "bin" in t["kind"]
+          ]
+
+          if len(bins) != 1:
+              raise SystemExit(
+                  f"Expected one binary in {package['name']}; found {bins}"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"package={package['name']}\n")
+              f.write(f"binary={bins[0]}\n")
+              f.write(f"slug={repo}\n")
+          PY
+
+      - name: Build Intel application
+        run: |
+          cargo build --release --locked \
+            -p "${{ steps.app.outputs.package }}" \
+            --target x86_64-apple-darwin
+
+      - name: Create macOS app bundle
+        shell: bash
+        run: |
+          SLUG="${{ steps.app.outputs.slug }}"
+          BIN="${{ steps.app.outputs.binary }}"
+
+          case "$SLUG" in
+            vectorcraft) DISPLAY="VectorCraft" ;;
+            filmcraft) DISPLAY="FilmCraft" ;;
+            pdfcraft) DISPLAY="PDFCraft" ;;
+            effectcraft) DISPLAY="EffectCraft" ;;
+            wordcraft) DISPLAY="WordCraft" ;;
+            soundcraft) DISPLAY="SoundCraft" ;;
+            gridcraft) DISPLAY="GridCraft" ;;
+            *) echo "Unknown app: $SLUG"; exit 1 ;;
+          esac
+
+          APP="${DISPLAY}.app"
+          ICON="assets/app-icon/${SLUG}.icns"
+
+          test -f "$ICON" || {
+            echo "Icon not found: $ICON"
+            exit 1
+          }
+
+          test -f "target/x86_64-apple-darwin/release/$BIN" || {
+            echo "Executable not found: $BIN"
+            exit 1
+          }
+
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          cp "target/x86_64-apple-darwin/release/$BIN" \
+             "$APP/Contents/MacOS/$DISPLAY"
+          chmod +x "$APP/Contents/MacOS/$DISPLAY"
+
+          cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>${DISPLAY}</string>
+            <key>CFBundleDisplayName</key>
+            <string>${DISPLAY}</string>
+            <key>CFBundleExecutable</key>
+            <string>${DISPLAY}</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.mdrakibhossainkst.${SLUG}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0.0</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon.icns</string>
+          </dict>
+          </plist>
+          PLIST
+
+          plutil -lint "$APP/Contents/Info.plist"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP" "${SLUG}-macos-intel.zip"
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.app.outputs.slug }}-macos-intel-app
+          path: ${{ steps.app.outputs.slug }}-macos-intel.zip
+          if-no-files-found: error
+          retention-days: 14
